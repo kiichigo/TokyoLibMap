@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>東京都 公営図書館 距離マップ</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .panel {
+      position: absolute; z-index: 1000; top: 12px; right: 12px; width: min(390px, calc(100vw - 24px));
+      background: rgba(255,255,255,.94); border-radius: 12px; box-shadow: 0 6px 28px rgba(0,0,0,.24);
+      padding: 14px 16px; line-height: 1.45;
+    }
+    .panel h1 { font-size: 18px; margin: 0 0 8px; }
+    .panel label { display: grid; grid-template-columns: 10em 1fr 4.5em; gap: 8px; align-items: center; font-size: 13px; }
+    .panel input[type="range"] { width: 100%; }
+    .legend { height: 14px; border-radius: 999px; margin: 10px 0 4px; background: linear-gradient(90deg,#fff7ec,#fdd49e,#fc8d59,#d7301f,#7f0000); border: 1px solid #ccc; }
+    .status { font-size: 12px; color: #333; white-space: pre-wrap; max-height: 9em; overflow: auto; }
+    .leaflet-tooltip { font-weight: 600; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+  <h1>東京都：最寄り公営図書館までの距離</h1>
+  <label>トーンカーブ γ <input id="gamma" type="range" min="0.25" max="3" step="0.05" value="0.65"><output id="gammaOut">0.65</output></label>
+  <label>上限距離 <input id="maxKm" type="range" min="1" max="35" step="0.5" value="12"><output id="maxKmOut">12 km</output></label>
+  <label>不透明度 <input id="opacity" type="range" min="0" max="0.9" step="0.05" value="0.55"><output id="opacityOut">0.55</output></label>
+  <label>解像度 <input id="step" type="range" min="18" max="80" step="2" value="34"><output id="stepOut">34 px</output></label>
+  <div class="legend"></div>
+  <div class="status" id="status">読み込み中… Overpass API から図書館と境界線を取得します。</div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+<script>
+const map = L.map('map').setView([35.6895, 139.6917], 10);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+const canvas = L.canvas({ padding: 0.5 });
+let libraryPoints = [], tokyoBoundary = null, heatLayer = null;
+const statusEl = document.getElementById('status');
+
+const query = `[out:json][timeout:180];
+area["name"="東京都"]["boundary"="administrative"]->.tokyo;
+(
+  nwr(area.tokyo)["amenity"="library"];
+  rel(area.tokyo)["boundary"="administrative"]["admin_level"~"^(7|8)$"];
+);
+out center geom tags;`;
+
+function km(a, b) { return turf.distance(turf.point([a.lng, a.lat]), turf.point([b.lng, b.lat]), {units: 'kilometers'}); }
+function color(t) {
+  const stops = [[255,247,236],[253,212,158],[252,141,89],[215,48,31],[127,0,0]];
+  t = Math.max(0, Math.min(1, t));
+  const x = t * (stops.length - 1), i = Math.min(stops.length - 2, Math.floor(x)), f = x - i;
+  return stops[i].map((v, k) => Math.round(v + (stops[i+1][k] - v) * f));
+}
+function redrawHeat() {
+  if (!libraryPoints.length || !tokyoBoundary) return;
+  if (heatLayer) map.removeLayer(heatLayer);
+  const gamma = +gammaEl.value, maxKm = +maxKmEl.value, opacity = +opacityEl.value, step = +stepEl.value;
+  gammaOut.value = gamma.toFixed(2); maxKmOut.value = `${maxKm} km`; opacityOut.value = opacity.toFixed(2); stepOut.value = `${step} px`;
+  const bounds = map.getBounds(), cells = [];
+  for (let y = 0; y < map.getSize().y; y += step) for (let x = 0; x < map.getSize().x; x += step) {
+    const ll = map.containerPointToLatLng([x + step/2, y + step/2]);
+    if (!turf.booleanPointInPolygon(turf.point([ll.lng, ll.lat]), tokyoBoundary)) continue;
+    let nearest = Infinity;
+    for (const p of libraryPoints) nearest = Math.min(nearest, km(ll, p));
+    const tone = Math.pow(Math.min(nearest / maxKm, 1), gamma), c = color(tone);
+    const nw = map.containerPointToLatLng([x, y]), se = map.containerPointToLatLng([x + step, y + step]);
+    cells.push(L.rectangle([[se.lat, nw.lng], [nw.lat, se.lng]], {renderer: canvas, stroke: false, fill: true, fillOpacity: opacity, fillColor: `rgb(${c.join(',')})`}));
+  }
+  heatLayer = L.layerGroup(cells).addTo(map);
+}
+async function load() {
+  const res = await fetch('https://overpass-api.de/api/interpreter', { method: 'POST', body: query });
+  if (!res.ok) throw new Error(`Overpass API error: ${res.status}`);
+  const data = await res.json();
+  const boundaryFeatures = [];
+  for (const el of data.elements) {
+    if (el.tags?.amenity === 'library') {
+      const lat = el.lat ?? el.center?.lat, lng = el.lon ?? el.center?.lon;
+      if (lat && lng) libraryPoints.push({lat, lng, name: el.tags.name || '図書館'});
+    } else if (el.type === 'relation' && el.tags?.boundary === 'administrative' && el.members) {
+      const lines = el.members.filter(m => m.geometry).map(m => m.geometry.map(g => [g.lon, g.lat]));
+      for (const line of lines) if (line.length > 2) boundaryFeatures.push(turf.lineString(line, {name: el.tags.name}));
+    }
+  }
+  libraryPoints.forEach(p => L.circleMarker([p.lat, p.lng], {radius: 4, color: '#064', fillColor: '#0b8', fillOpacity: .9, weight: 1}).bindTooltip(p.name).addTo(map));
+  boundaryFeatures.forEach(f => L.geoJSON(f, {style: {color: '#333', weight: 1.2, opacity: .65}}).addTo(map));
+  // Mainland Tokyo analysis mask. Islands are intentionally omitted so the color scale remains useful for the city and Tama area.
+  tokyoBoundary = turf.bboxPolygon([138.85, 35.45, 140.05, 35.95]);
+  statusEl.textContent = `図書館 ${libraryPoints.length} 件を表示。市区町村境界線を重ねています。\nγを小さくすると市街地の距離差が強調され、上限距離を下げると近距離域が赤くなります。`;
+  redrawHeat();
+}
+const gammaEl = document.getElementById('gamma'), maxKmEl = document.getElementById('maxKm'), opacityEl = document.getElementById('opacity'), stepEl = document.getElementById('step');
+const gammaOut = document.getElementById('gammaOut'), maxKmOut = document.getElementById('maxKmOut'), opacityOut = document.getElementById('opacityOut'), stepOut = document.getElementById('stepOut');
+[gammaEl, maxKmEl, opacityEl, stepEl].forEach(el => el.addEventListener('input', redrawHeat));
+map.on('moveend zoomend', redrawHeat);
+load().catch(err => { statusEl.textContent = `読み込みに失敗しました: ${err.message}\n別のネットワークで開くか、Overpass API の混雑が解消してから再読み込みしてください。`; console.error(err); });
+</script>
+</body>
+</html>
